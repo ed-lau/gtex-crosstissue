@@ -1,0 +1,334 @@
+---
+title: "20220401_Adipose_Heart"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+
+library(tidyverse)
+library(DESeq2)
+library(hpar)
+library(Hmisc)
+library(caret)
+library(PLIER)
+library(stringr)
+
+data(hpaSecretome)
+
+source("../Edward/gtex_v8/plier/plier_util.R")
+
+```
+
+# Secretome to latent variable correlations
+
+This document will apply a trained PLIER model to the GTEx v8 left ventricle data on samples that also have adipose tissue RNA-seq data.
+It will then find the adipose secreted genes, and perform a correlation matrix with the heart latent variables.
+
+# Note: GTEx Tissue List
+
+# SMTSD
+ [1] "Adipose - Subcutaneous"                    "Adipose - Visceral (Omentum)"              "Adrenal Gland"                             "Artery - Aorta"                            "Artery - Coronary"                        
+ [6] "Artery - Tibial"                           "Bladder"                                   "Brain - Amygdala"                          "Brain - Anterior cingulate cortex (BA24)"  "Brain - Caudate (basal ganglia)"          
+[11] "Brain - Cerebellar Hemisphere"             "Brain - Cerebellum"                        "Brain - Cortex"                            "Brain - Frontal Cortex (BA9)"              "Brain - Hippocampus"                      
+[16] "Brain - Hypothalamus"                      "Brain - Nucleus accumbens (basal ganglia)" "Brain - Putamen (basal ganglia)"           "Brain - Spinal cord (cervical c-1)"        "Brain - Substantia nigra"                 
+[21] "Breast - Mammary Tissue"                   "Cells - Cultured fibroblasts"              "Cells - EBV-transformed lymphocytes"       "Cells - Leukemia cell line (CML)"          "Cervix - Ectocervix"                      
+[26] "Cervix - Endocervix"                       "Colon - Sigmoid"                           "Colon - Transverse"                        "Esophagus - Gastroesophageal Junction"     "Esophagus - Mucosa"                       
+[31] "Esophagus - Muscularis"                    "Fallopian Tube"                            "Heart - Atrial Appendage"                  "Heart - Left Ventricle"                    "Kidney - Cortex"                          
+[36] "Kidney - Medulla"                          "Liver"                                     "Lung"                                      "Minor Salivary Gland"                      "Muscle - Skeletal"                        
+[41] "Nerve - Tibial"                            "Ovary"                                     "Pancreas"                                  "Pituitary"                                 "Prostate"                                 
+[46] "Skin - Not Sun Exposed (Suprapubic)"       "Skin - Sun Exposed (Lower leg)"            "Small Intestine - Terminal Ileum"          "Spleen"                                    "Stomach"                                  
+[51] "Testis"                                    "Thyroid"                                   "Uterus"                                    "Vagina"                                    "Whole Blood"       
+
+# SMTS
+[1] "Adipose Tissue"  "Adrenal Gland"   "Bladder"         "Blood"           "Blood Vessel"    "Bone Marrow"     "Brain"           "Breast"          "Cervix Uteri"    "Colon"           "Esophagus"       "Fallopian Tube"  "Heart"          
+[14] "Kidney"          "Liver"           "Lung"            "Muscle"          "Nerve"           "Ovary"           "Pancreas"        "Pituitary"       "Prostate"        "Salivary Gland"  "Skin"            "Small Intestine" "Spleen"         
+[27] "Stomach"         "Testis"          "Thyroid"         "Uterus"          "Vagina"         
+
+
+# Note: MoTrPAC Tissue List
+"Gastrocnemius" "Heart"         "Liver"         "White Adipose"
+
+# PLIER Model
+
+First, we previously trained a PLIER model using VST transformed GTEx v8 data without secretome genes, which was trained using the MultiPLIER wrapper against three annotations: bloodCellMarkersIRISDMAP, svmMarkers, canonicalPathways
+
+Then, we open the gene expression matrix file, this will be either GTEx v8 subset where each donor has two tissues sequenced, or it will be MoTrPAC
+
+
+Read the GTEx annotation file
+
+```{r}
+
+
+CreateTissueCorrelation <- function(plier, 
+                                    deseq, 
+                                    # metadata, 
+                                    source_tissue,
+                                    target_tissue,
+                                    secretome_annotation,
+                                    bonferroni_threshold,
+                                    study="gtex") {
+    # This function will take in a data set from GTEx or from MoTrPAC
+    # then create a correlation matrix between the secretome gene in the source tissue
+    # and the PLIER latent variables in the target tissue
+    # It will output the subset data matrix and the list of significant correlation for downstream analysis
+    # params
+    # plier: the plier model
+    # deseq: the data set deseq object
+    # source_tissue: which tissue is the source, e.g., adipose
+    # target_tissue: which tissue is the target, e.g., heart
+    # secretome annotation: HPA secretome
+    # bonferroni_threshold: padj threshold to export
+    # study: either "gtex" or "motrpac"
+    
+    # Get annotation from DESeq2 file
+    annot <- colData(deseq) %>% as.data.frame()
+    
+    if (study == "gtex"){
+      
+        # If this is a GTEx data set, we will create the subject ID from the sample ID
+        annot$SUBJECT <- gsub('GTEX-([A-Z0-9]*)-.*$', "\\1", annot$SAMPID)
+    
+        # Subset the Sample annotations to take only subject ID, sample ID, and tissue types/subtypes
+        # Note that GTEx has SMTS (top level tissue) and SMTSD (finer level distinction)
+        annot. <- annot %>% dplyr::select(sample_id = SAMPID, subject_id = SUBJECT, tissue = SMTSD, SMAFRZE)
+        
+       
+        # Subset the GTEx data to only those subjects with both tissues
+        annot.. <- annot. %>% dplyr::filter(SMAFRZE == "RNASEQ", tissue %in% c(source_tissue, target_tissue)) 
+        annot.. <- annot.. %>% dplyr::distinct(tissue, subject_id, .keep_all=T)
+    
+    } else if (study == "motrpac") {
+      
+        annot. <- annot %>% dplyr::select(sample_id = vial_label, subject_id = pid, tissue =  specimen.processing.sampletypedescription)
+                                          
+        # Subset the MoTrPAC data to only those subjects with both tissues
+
+        annot.. <- annot. %>% dplyr::filter(tissue %in% c(source_tissue, target_tissue)) 
+        annot.. <- annot.. %>% dplyr::distinct(tissue, subject_id, .keep_all=T)
+      
+    }
+    
+  # Print out the tissues available
+    print("Available Tissues:")
+    annot.$tissue %>% sort() %>% unique() %>% print()
+          
+  
+    # How many samples have all the organs
+    samples_in_subjects_with_both_tissues <- annot.. %>% group_by(subject_id) %>% dplyr::filter(n_distinct(tissue) == 2) %>% dplyr::ungroup()
+  
+  
+    # How many subjects are left?
+    subject_count <- samples_in_subjects_with_both_tissues %>% dplyr::distinct(subject_id) %>% nrow() 
+    print(paste0("Number of subjects with both tissues: ", subject_count))
+    
+    if(subject_count < 10){
+      print("Not enough subjects with both tissues, skipping")
+      return(NULL)
+    }
+    
+    #
+    # This section will deal with the target tissue
+    #
+    
+    # Subset the DESeq file with the tissues and subjects to keep
+    target_samples <- samples_in_subjects_with_both_tissues %>% dplyr::filter(tissue == target_tissue)
+    deseq_target_samples <- assay(deseq)[, target_samples$sample_id]
+    
+    # Remove secretome genes from the target tissue data
+    hpa_secreted_to_blood <- secretome_annotation %>% dplyr::filter(`Secretome.location` == "Secreted to blood") %>% dplyr::select(`Gene.name`, `Secretome.location`)
+    deseq_target_samples_sans_secretome <- deseq_target_samples[!rownames(deseq_target_samples) %in% hpa_secreted_to_blood$Gene.name, ]
+  
+    # Remove zero variance genes
+    print("Removing zero variance genes from target tissue")
+    deseq_target_samples_in <- deseq_target_samples_sans_secretome[-caret::nearZeroVar(t(deseq_target_samples_sans_secretome)),]
+
+
+    # Apply the PLIER model to the new data to get the B matrix (LV x samples)
+    print("Applying PLIER model")
+    deseq_target_B <- GetNewDataB(deseq_target_samples_in, plier_model)
+
+    deseq_target_B[1:5, 1:5] %>% print()
+    
+    #
+    # Compare the true matrix with the reconstructed matrix
+    #
+    
+    # Reconstructed matrix from Z ** B
+    deseq_target_recon <- GetReconstructedExprs(plier_model$Z, deseq_target_B)
+    MASE <- GetReconstructionMASE(GetOrderedRowNorm(deseq_target_samples_in, plier_model), deseq_target_recon)
+    #hist(MASE)
+    print(paste("Median MASE:",  median(MASE)))
+    COR <- GetReconstructionCorrelation(GetOrderedRowNorm(deseq_target_samples_in, plier_model), deseq_target_recon) # Note, modify the plier utils from multiplier to namespace stats::cor()
+    # hist(COR)
+    print(paste("Median COR:",  median(COR)))
+    
+    #
+    # This section will create a source tissue matrix consisting of the secreted proteins only
+    #
+    
+    source_samples <- samples_in_subjects_with_both_tissues %>% dplyr::filter(tissue == source_tissue)
+    deseq_source_samples <- assay(deseq)[, source_samples$sample_id]
+    
+    # remove zero var genes again
+    print("Removing zero variance genes from source tissue")
+    deseq_source_samples_var <- deseq_source_samples[-caret::nearZeroVar(t(deseq_source_samples)), ]
+    deseq_source_samples_secretome <- deseq_source_samples_var[rownames(deseq_source_samples_var) %in% hpa_secreted_to_blood$Gene.name, ]
+    
+    
+    # Copy new matrices for combining by subject
+    deseq_target_B_subject <- deseq_target_B
+    deseq_source_samples_subject <-  deseq_source_samples_secretome # Use all genes: gtex_source_samples_var 
+    
+    # Now we need to turn the sample ID in the column names into subject ID
+    if(study == "gtex"){
+      colnames(deseq_source_samples_subject) <-  gsub('GTEX-([A-Z0-9]*)-.*$', "\\1", colnames(deseq_source_samples_subject))
+      rownames(deseq_source_samples_subject) <- paste0("Source_", rownames(deseq_source_samples_subject))
+      
+      colnames(deseq_target_B_subject) <-  gsub('GTEX-([A-Z0-9]*)-.*$', "\\1", colnames(deseq_target_B_subject))
+      rownames(deseq_target_B_subject) <- paste0("Target_", rownames(deseq_target_B_subject))
+  
+    } else if (study == "motrpac") {
+      
+      # Now we need to turn the sample ID in the column names into subject ID
+      colnames(deseq_source_samples_subject) <- annot..[colnames(deseq_source_samples_subject), 'subject_id']
+      rownames(deseq_source_samples_subject) <- paste0("Source_", rownames(deseq_source_samples_subject))
+      
+      colnames(deseq_target_B_subject) <-annot..[colnames(deseq_target_B_subject), 'subject_id']
+      rownames(deseq_target_B_subject) <- paste0("Target_", rownames(deseq_target_B_subject))
+        
+    }
+    
+    # Check that all column names are equal
+    print("Checking all column names in the source and target matrices are equal:")
+    
+    # Reorder the target subject matrix to match the source subject order
+    deseq_target_B_subject <- deseq_target_B_subject[, colnames(deseq_source_samples_subject)]
+    
+    print(all.equal(colnames(deseq_source_samples_subject), colnames(deseq_target_B_subject)))
+    print(colnames(deseq_source_samples_subject))
+    print(colnames(deseq_target_B_subject))
+    
+    print("Source protein matrix:")
+    print(deseq_source_samples_subject[1:5, 1:5])
+    
+    print("Target variable matrix:")
+    print(deseq_target_B_subject[1:5, 1:5])
+    
+    source_target_matrix <- rbind(deseq_source_samples_subject, deseq_target_B_subject)
+  
+    # Write the source_target_matrix into a tsv file
+    matrix_write_path = file.path("../processed/", paste0(study, "_", 
+                                                     stringr::str_replace_all(source_tissue, " ", ""), 
+                                                     "_to_", 
+                                                      stringr::str_replace_all(target_tissue, " ", ""),
+                                                     "_data.txt"))
+    readr::write_tsv(as.data.frame(source_target_matrix) %>% rownames_to_column(), file=matrix_write_path)
+    # Subsample some genes from all genes to calculate cor instead
+    # rbind(gtex_source_samples_subject[sample(nrow(gtex_source_samples_subject), 10000, replace=F), ], gtex_target_B_subject)
+
+    #
+    # Calculate correlation
+    #
+    
+    print("Calculating correlation")
+    cor_r <- Hmisc::rcorr(t(source_target_matrix))
+
+    r_long <- tidyr::pivot_longer(as.data.frame(cor_r$r) %>% tibble::rownames_to_column(var='cor1'), cols=-cor1, names_to = 'cor2', values_to='r')
+    p_long <- tidyr::pivot_longer(as.data.frame(cor_r$P) %>% tibble::rownames_to_column(var='cor1'), cols=-cor1, names_to = 'cor2', values_to='p')
+    
+    cor_out <- dplyr::full_join(r_long, p_long)
+    cor_out$padj <- p.adjust(cor_out$p, method='bonferroni')
+    
+    #  Get significant source to target correlations
+    cor_out_significant_cross_tissue <- cor_out %>% dplyr::filter(startsWith(cor1, "Source_"), startsWith(cor2, "Target_"), padj <= bonferroni_threshold)
+
+    print(cor_out_significant_cross_tissue %>% dplyr::arrange(padj))
+    # Write the correlation results into a tsv file
+    corr_write_path = file.path("../processed/", paste0(study, "_", 
+                                                     stringr::str_replace_all(source_tissue, " ", ""), 
+                                                     "_to_", 
+                                                      stringr::str_replace_all(target_tissue, " ", ""),
+                                                     "_results.txt"))
+    readr::write_tsv(cor_out_significant_cross_tissue, file=corr_write_path)
+    
+    return(cor_out_significant_cross_tissue)   
+}
+
+
+
+
+
+```
+
+
+
+Running: all pairwise comparisons between Heart, Adipose Tissue, Muscle, Liver in GTEx
+and Gastrocnemius Heart Liver White Adipose in MoTrPC
+```{r}
+plier_model <- readRDS("../Edward/gtex_v8/plier/GTExv8VSTcomBATAgeCorrNoSecretome_canonicalPathwaysBloodCellSVM_multiplier_v2.Rds")
+gtex <- readRDS("../Edward/gtex_v8/gtexv8_vst_combat3_dds.Rds")
+mtp <- readRDS("../data/motrpac_vst_combat2_dds.Rds")
+
+gtex_tissues <- c("Heart", "Adipose Tissue", "Muscle", "Liver")
+motrpac_tissues <- c("Heart", "White Adipose", "Gastrocnemius", "Liver")
+
+all_gtex_tissues <- unique(colData(gtex)$SMTSD)
+
+```
+
+Loop through all Gtex tissues and write out files
+```{r eval=F, include=F}
+
+
+
+for (source_todo in all_gtex_tissues){
+  for(target_todo in all_gtex_tissues){
+    if (source_todo != target_todo){
+      print(paste(source_todo, target_todo))
+
+      matrix_write_path = file.path("../processed/", paste0("gtex", "_", 
+                                                     stringr::str_replace_all(source_todo, " ", ""), 
+                                                     "_to_", 
+                                                      stringr::str_replace_all(target_todo, " ", ""),
+                                                     "_data.txt"))
+
+      # Check if file exists
+      if (!file.exists(matrix_write_path)){
+        CreateTissueCorrelation(plier = plier_model,
+                        deseq = gtex,
+                        source_tissue = source_todo,
+                        target_tissue = target_todo,
+                        secretome_annotation = hpaSecretome(),
+                        bonferroni_threshold = 0.01,
+                        study="gtex"
+                        ) # -> gtex_adipose_to_heart
+      } else {
+        print("File exists, skipping")
+      }
+    }
+  }
+}
+
+for (source_todo in motrpac_tissues){
+  for(target_todo in motrpac_tissues){
+    if (source_todo != target_todo){
+      print(paste(source_todo, target_todo))
+CreateTissueCorrelation(plier = plier_model,
+                        deseq = mtp,
+                        source_tissue = source_todo,
+                        target_tissue = target_todo,
+                        secretome_annotation = hpaSecretome(),
+                        bonferroni_threshold = 0.01,
+                        study="motrpac"
+                        ) # -> motrpac_adipose_to_heart
+    }
+  }
+}
+
+```
+
+
+
